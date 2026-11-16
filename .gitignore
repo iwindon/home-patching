@@ -1,0 +1,36 @@
+# Backup files
+*.backup
+*.backup-*
+*.bk
+
+# Ansible retry files
+*.retry
+
+# Ansible Vault passwords / secrets
+.vault_pass
+.vault_pass.txt
+vault_password
+vault_password.txt
+secrets.yml
+secrets.yaml
+
+# Environment / credentials
+.env
+.env.*
+*.secret
+*.key
+*.pem
+id_rsa
+id_ed25519
+
+# Generated reports and logs
+reports/
+*.log
+
+# Temporary/editor files
+*.tmp
+*.swp
+*.swo
+*~
+__pycache__/
+*.pyc

@@ -1,0 +1,291 @@
+---
+- name: Validate patch run ID
+  ansible.builtin.assert:
+    that:
+      - patch_run_id is defined
+      - patch_run_id | length > 0
+    fail_msg: >-
+      patch_run_id is not defined.
+      Run this playbook through run-patching.sh.
+
+- name: Display host being patched
+  ansible.builtin.debug:
+    msg: >-
+      Patching {{ inventory_hostname }}
+      running {{ ansible_distribution }}
+      {{ ansible_distribution_version }}
+
+- name: Set default patch facts
+  ansible.builtin.set_fact:
+    packages_changed: false
+    reboot_required: false
+    reboot_performed: false
+    reboot_scheduled: false
+    patch_controller: "{{ inventory_hostname in groups['controller'] }}"
+    package_update_report: "No packages were updated."
+
+
+# ============================================================
+# Fedora / Red Hat
+# ============================================================
+
+- name: Patch Fedora and Red Hat systems
+  when: ansible_os_family == "RedHat"
+  block:
+
+    - name: Update all installed RPM packages
+      ansible.builtin.dnf:
+        name: "*"
+        state: latest
+        update_only: true
+        update_cache: true
+      register: rpm_updates
+
+    - name: Record whether RPM packages changed
+      ansible.builtin.set_fact:
+        packages_changed: "{{ rpm_updates.changed }}"
+
+    - name: Get latest DNF transaction details
+      ansible.builtin.command:
+        cmd: dnf history info
+      register: dnf_transaction
+      changed_when: false
+      when: rpm_updates.changed
+
+    - name: Store RPM transaction report
+      ansible.builtin.set_fact:
+        package_update_report: >-
+          {{
+            dnf_transaction.stdout
+            if rpm_updates.changed
+            else "No RPM packages were updated."
+          }}
+
+    - name: Determine whether RPM system requires a reboot
+      ansible.builtin.command:
+        cmd: dnf needs-restarting -r
+      register: rpm_reboot_check
+      changed_when: false
+      failed_when: rpm_reboot_check.rc not in [0, 1]
+      when: rpm_updates.changed
+
+    - name: Set RPM reboot requirement
+      ansible.builtin.set_fact:
+        reboot_required: >-
+          {{
+            rpm_updates.changed and
+            rpm_reboot_check.rc | default(0) == 1
+          }}
+
+
+# ============================================================
+# Debian / Ubuntu
+# ============================================================
+
+- name: Patch Debian and Ubuntu systems
+  when: ansible_os_family == "Debian"
+  block:
+
+    - name: Update apt cache and install available upgrades
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+        upgrade: dist
+      register: apt_updates
+
+    - name: Record whether APT packages changed
+      ansible.builtin.set_fact:
+        packages_changed: "{{ apt_updates.changed }}"
+
+    - name: Store APT transaction report
+      ansible.builtin.set_fact:
+        package_update_report: >-
+          {{
+            apt_updates.stdout
+            | default("No APT package output was returned.")
+            if apt_updates.changed
+            else "No APT packages were updated."
+          }}
+
+    - name: Check for Ubuntu reboot-required marker
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: ubuntu_reboot_marker
+
+    - name: Set Ubuntu reboot requirement
+      ansible.builtin.set_fact:
+        reboot_required: "{{ ubuntu_reboot_marker.stat.exists }}"
+
+
+# ============================================================
+# Unsupported operating systems
+# ============================================================
+
+- name: Fail when the operating system is unsupported
+  ansible.builtin.fail:
+    msg: >-
+      Unsupported operating system on {{ inventory_hostname }}:
+      {{ ansible_distribution }}
+      {{ ansible_distribution_version }}
+  when: ansible_os_family not in ["RedHat", "Debian"]
+
+
+# ============================================================
+# Reboot decision
+# ============================================================
+
+- name: Display reboot decision
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} patching completed.
+      Packages changed: {{ packages_changed | bool }}.
+      Reboot required: {{ reboot_required | bool }}.
+      Ansible controller: {{ patch_controller | bool }}.
+
+
+# ============================================================
+# Normal servers reboot here.
+#
+# Saturn does NOT reboot here because Saturn is running Ansible.
+# ============================================================
+
+- name: Reboot managed host when required
+  ansible.builtin.reboot:
+    msg: "Reboot initiated by Saturn after operating-system patching"
+    connect_timeout: 10
+    reboot_timeout: 900
+    pre_reboot_delay: 0
+    post_reboot_delay: 15
+    test_command: /usr/bin/true
+  when:
+    - reboot_required | bool
+    - not patch_controller | bool
+
+- name: Record managed host reboot completion
+  ansible.builtin.set_fact:
+    reboot_performed: true
+  when:
+    - reboot_required | bool
+    - not patch_controller | bool
+
+- name: Refresh facts after managed host reboot
+  ansible.builtin.setup:
+  when:
+    - reboot_required | bool
+    - not patch_controller | bool
+
+
+# ============================================================
+# Saturn/controller handling
+# ============================================================
+
+- name: Mark controller reboot as scheduled
+  ansible.builtin.set_fact:
+    reboot_scheduled: true
+  when:
+    - reboot_required | bool
+    - patch_controller | bool
+
+- name: Display controller delayed reboot notice
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} requires a reboot.
+      The reboot is being deferred until patch reporting
+      and dashboard publication are complete.
+  when:
+    - reboot_required | bool
+    - patch_controller | bool
+
+
+# ============================================================
+# Verify current host
+# ============================================================
+
+- name: Confirm host is operational
+  ansible.builtin.ping:
+
+
+# ============================================================
+# Reports stored on Saturn
+# ============================================================
+
+- name: Ensure run-specific report directory exists on Saturn
+  ansible.builtin.file:
+    path: "/var/log/ansible/reports/{{ patch_run_id }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+  delegate_to: localhost
+  become: true
+
+- name: Write timestamped host patch report on Saturn
+  ansible.builtin.copy:
+    dest: >-
+      /var/log/ansible/reports/{{ patch_run_id }}/{{ inventory_hostname }}.txt
+    owner: root
+    group: root
+    mode: "0640"
+    content: |
+      Home Server Patch Report
+      ========================
+
+      Patch run: {{ patch_run_id }}
+      Host: {{ inventory_hostname }}
+      Address: {{ ansible_host | default(inventory_hostname) }}
+      Operating system: {{ ansible_distribution }} {{ ansible_distribution_version }}
+      Kernel running when report was generated: {{ ansible_kernel }}
+
+      Packages changed: {{ packages_changed | bool }}
+      Reboot required: {{ reboot_required | bool }}
+      Reboot performed: {{ reboot_performed | bool }}
+      Reboot scheduled: {{ reboot_scheduled | bool }}
+      Host reachable after patching: true
+
+      Package Manager Transaction
+      ---------------------------
+      {{ package_update_report }}
+  delegate_to: localhost
+  become: true
+
+- name: Update latest host report
+  ansible.builtin.copy:
+    dest: >-
+      /var/log/ansible/reports/{{ inventory_hostname }}-latest.txt
+    owner: root
+    group: root
+    mode: "0640"
+    content: |
+      Home Server Patch Report
+      ========================
+
+      Patch run: {{ patch_run_id }}
+      Host: {{ inventory_hostname }}
+      Address: {{ ansible_host | default(inventory_hostname) }}
+      Operating system: {{ ansible_distribution }} {{ ansible_distribution_version }}
+      Kernel running when report was generated: {{ ansible_kernel }}
+
+      Packages changed: {{ packages_changed | bool }}
+      Reboot required: {{ reboot_required | bool }}
+      Reboot performed: {{ reboot_performed | bool }}
+      Reboot scheduled: {{ reboot_scheduled | bool }}
+      Host reachable after patching: true
+
+      Package Manager Transaction
+      ---------------------------
+      {{ package_update_report }}
+  delegate_to: localhost
+  become: true
+
+
+# ============================================================
+# Final status
+# ============================================================
+
+- name: Report final host status
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} is reachable.
+      Running kernel: {{ ansible_kernel }}.
+      Reboot performed: {{ reboot_performed | bool }}.
+      Reboot scheduled: {{ reboot_scheduled | bool }}.

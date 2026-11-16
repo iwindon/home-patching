@@ -1,0 +1,289 @@
+---
+# ============================================================
+# Patch application servers first
+# ============================================================
+
+- name: Patch application servers
+  hosts: application_servers
+  become: true
+  gather_facts: true
+  serial: 1
+
+  tasks:
+    - name: Patch application server
+      ansible.builtin.include_tasks: patch-host.yml
+
+
+# ============================================================
+# Patch infrastructure servers second
+# ============================================================
+
+- name: Patch infrastructure servers
+  hosts: infrastructure_servers
+  become: true
+  gather_facts: true
+  serial: 1
+
+  tasks:
+    - name: Patch infrastructure server
+      ansible.builtin.include_tasks: patch-host.yml
+
+
+# ============================================================
+# Patch Saturn/controller LAST
+#
+# patch-host.yml detects that this is the controller and will
+# NOT reboot it yet.
+# ============================================================
+
+- name: Patch Saturn last
+  hosts: controller
+  become: true
+  gather_facts: true
+  serial: 1
+
+  tasks:
+    - name: Patch Saturn
+      ansible.builtin.include_tasks: patch-host.yml
+
+
+# ============================================================
+# Build combined patch summary
+# ============================================================
+
+- name: Build combined patch summary
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: true
+
+  vars:
+    reported_hosts: >-
+      {{
+        (
+          groups['application_servers']
+          + groups['infrastructure_servers']
+          + groups['controller']
+        )
+        | unique
+        | list
+      }}
+
+  tasks:
+    - name: Write combined patch summary
+      ansible.builtin.copy:
+        dest: "/var/log/ansible/reports/{{ patch_run_id }}/summary.txt"
+        owner: root
+        group: root
+        mode: "0640"
+        content: |
+          Home Infrastructure Patch Summary
+          =================================
+
+          Patch run: {{ patch_run_id }}
+
+          {% for host in reported_hosts %}
+          Host: {{ host }}
+          Address: {{ hostvars[host].ansible_host | default(host) }}
+          Operating system: {{ hostvars[host].ansible_distribution | default("Unknown") }} {{ hostvars[host].ansible_distribution_version | default("") }}
+          Kernel: {{ hostvars[host].ansible_kernel | default("Unknown") }}
+          Packages changed: {{ hostvars[host].packages_changed | default(false) | bool }}
+          Reboot required: {{ hostvars[host].reboot_required | default(false) | bool }}
+          Reboot performed: {{ hostvars[host].reboot_performed | default(false) | bool }}
+          Reboot scheduled: {{ hostvars[host].reboot_scheduled | default(false) | bool }}
+          Report: {{ host }}.txt
+
+          {% endfor %}
+
+
+# ============================================================
+# Generate dashboard locally on Saturn
+# ============================================================
+
+- name: Generate patch dashboard on Saturn
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: true
+  tags:
+    - dashboard
+
+  tasks:
+    - name: Generate dashboard HTML
+      ansible.builtin.template:
+        src: templates/patch-dashboard.html.j2
+        dest: "/var/log/ansible/reports/{{ patch_run_id }}/index.html"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Calculate generated dashboard checksum
+      ansible.builtin.command:
+        cmd: "sha256sum /var/log/ansible/reports/{{ patch_run_id }}/index.html"
+      register: generated_dashboard_checksum
+      changed_when: false
+
+    - name: Display generated dashboard information
+      ansible.builtin.debug:
+        msg:
+          - "Dashboard: /var/log/ansible/reports/{{ patch_run_id }}/index.html"
+          - "SHA256: {{ generated_dashboard_checksum.stdout.split()[0] }}"
+
+
+# ============================================================
+# Publish dashboard to Panther
+#
+# This MUST complete before Saturn is allowed to reboot.
+# ============================================================
+
+- name: Publish patch dashboard to Panther
+  hosts: panther
+  gather_facts: false
+  become: true
+  tags:
+    - dashboard
+
+  tasks:
+    - name: Confirm publication target
+      ansible.builtin.command:
+        cmd: hostname
+      register: publication_hostname
+      changed_when: false
+
+    - name: Display publication target
+      ansible.builtin.debug:
+        msg: >-
+          Publishing dashboard to {{ publication_hostname.stdout }}
+          at {{ ansible_host }}.
+
+    - name: Create dashboard directory
+      ansible.builtin.file:
+        path: /var/www/html/patching
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Create patch report directory
+      ansible.builtin.file:
+        path: /var/www/html/patching/reports
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Find host patch reports for current run on Saturn
+      ansible.builtin.find:
+        paths: "/var/log/ansible/reports/{{ patch_run_id }}"
+        patterns: "*.txt"
+        excludes:
+          - "summary.txt"
+        file_type: file
+      register: patch_report_files
+      delegate_to: localhost
+      become: true
+
+    - name: Generate and publish HTML patch reports to Panther
+      ansible.builtin.template:
+        src: templates/patch-report.html.j2
+        dest: >-
+          /var/www/html/patching/reports/{{
+            item.path | basename | regex_replace('\.txt$', '.html')
+          }}
+        owner: root
+        group: root
+        mode: "0644"
+        force: true
+      vars:
+        report_host: >-
+          {{ item.path | basename | regex_replace('\.txt$', '') }}
+        report_content: "{{ lookup('ansible.builtin.file', item.path) }}"
+      loop: "{{ patch_report_files.files }}"
+      loop_control:
+        label: >-
+          {{ item.path | basename | regex_replace('\.txt$', '.html') }}
+
+    - name: Copy dashboard from Saturn to Panther
+      ansible.builtin.copy:
+        src: "/var/log/ansible/reports/{{ patch_run_id }}/index.html"
+        dest: /var/www/html/patching/index.html
+        owner: root
+        group: root
+        mode: "0644"
+        force: true
+
+    - name: Restore SELinux context
+      ansible.builtin.command:
+        cmd: restorecon -Rv /var/www/html/patching
+      changed_when: false
+
+    - name: Verify dashboard exists
+      ansible.builtin.command:
+        cmd: test -s /var/www/html/patching/index.html
+      changed_when: false
+
+    - name: Get published dashboard details
+      ansible.builtin.command:
+        cmd: stat /var/www/html/patching/index.html
+      register: published_dashboard_stat
+      changed_when: false
+
+    - name: Display published dashboard details
+      ansible.builtin.debug:
+        var: published_dashboard_stat.stdout_lines
+
+    - name: Calculate Panther dashboard checksum
+      ansible.builtin.command:
+        cmd: sha256sum /var/www/html/patching/index.html
+      register: panther_dashboard_checksum
+      changed_when: false
+
+    - name: Display Panther dashboard checksum
+      ansible.builtin.debug:
+        msg: >-
+          Panther SHA256:
+          {{ panther_dashboard_checksum.stdout.split()[0] }}
+
+
+# ============================================================
+# LAST PLAY IN THE ENTIRE PLAYBOOK
+#
+# At this point:
+#   - all machines have been patched
+#   - reports have been written
+#   - summary has been written
+#   - dashboard has been generated
+#   - dashboard has been copied to Panther
+#
+# It is now safe to schedule Saturn's reboot.
+# ============================================================
+
+- name: Schedule Saturn reboot after patch reporting is complete
+  hosts: controller
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Schedule delayed Saturn reboot
+      ansible.builtin.command:
+        cmd: shutdown -r +2 "Reboot after Ansible patching completed"
+      changed_when: true
+      when:
+        - reboot_required | default(false) | bool
+
+    - name: Confirm Saturn reboot has been scheduled
+      ansible.builtin.debug:
+        msg: >-
+          Saturn requires a reboot.
+          Reports and dashboard publication are complete.
+          Saturn will reboot in approximately two minutes.
+      when:
+        - reboot_required | default(false) | bool
+
+    - name: Confirm Saturn does not require a reboot
+      ansible.builtin.debug:
+        msg: >-
+          Saturn does not require a reboot.
+          Patching, reporting, and dashboard publication are complete.
+      when:
+        - not (reboot_required | default(false) | bool)

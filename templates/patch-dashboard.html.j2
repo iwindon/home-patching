@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Home Infrastructure Patch Status</title>
+
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: Arial, Helvetica, sans-serif;
+            background: #111827;
+            color: #e5e7eb;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 32px;
+        }
+
+        h1 {
+            margin-bottom: 5px;
+            color: #ffffff;
+        }
+
+        .subtitle {
+            color: #9ca3af;
+            margin-bottom: 30px;
+        }
+
+        .summary {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 16px;
+            margin-bottom: 30px;
+        }
+
+        .summary-card {
+            background: #1f2937;
+            padding: 20px;
+            border-radius: 10px;
+            border: 1px solid #374151;
+        }
+
+        .summary-card .label {
+            color: #9ca3af;
+            font-size: 14px;
+        }
+
+        .summary-card .value {
+            font-size: 24px;
+            font-weight: bold;
+            margin-top: 8px;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: #1f2937;
+            border-radius: 10px;
+            overflow: hidden;
+        }
+
+        th {
+            background: #374151;
+            text-align: left;
+            padding: 14px;
+            color: #f9fafb;
+        }
+
+        td {
+            padding: 14px;
+            border-bottom: 1px solid #374151;
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+
+        tr:hover {
+            background: #263244;
+        }
+
+        .status-ok {
+            color: #34d399;
+            font-weight: bold;
+        }
+
+        .status-updated {
+            color: #60a5fa;
+            font-weight: bold;
+        }
+
+        .status-reboot {
+            color: #fbbf24;
+            font-weight: bold;
+        }
+
+        .yes {
+            color: #60a5fa;
+        }
+
+        .no {
+            color: #9ca3af;
+        }
+
+        .server {
+            color: #ffffff;
+            font-weight: bold;
+        }
+
+        .ip {
+            color: #9ca3af;
+            font-family: monospace;
+            font-size: 13px;
+        }
+
+        .footer {
+            margin-top: 25px;
+            color: #6b7280;
+            font-size: 13px;
+        }
+
+        @media (max-width: 800px) {
+            .container {
+                padding: 16px;
+            }
+
+            table {
+                font-size: 13px;
+            }
+
+            th, td {
+                padding: 8px;
+            }
+        }
+    </style>
+</head>
+
+<body>
+
+<div class="container">
+
+    <h1>Home Infrastructure Patch Status</h1>
+
+    <div class="subtitle">
+        Patch run: {{ patch_run_id }}
+    </div>
+
+    {% set application_hosts = groups['application_servers'] | default([]) %}
+    {% set infrastructure_hosts = groups['infrastructure_servers'] | default([]) %}
+    {% set controller_hosts = groups['controller'] | default([]) %}
+    {% set dashboard_hosts = application_hosts + infrastructure_hosts + controller_hosts %}
+
+    <div class="summary">
+
+        <div class="summary-card">
+            <div class="label">Servers</div>
+            <div class="value">{{ dashboard_hosts | length }}</div>
+        </div>
+
+        <div class="summary-card">
+            <div class="label">Patch Run</div>
+            <div class="value">{{ patch_run_id }}</div>
+        </div>
+
+        <div class="summary-card">
+            <div class="label">Controller</div>
+            <div class="value">Saturn</div>
+        </div>
+
+    </div>
+
+    <table>
+
+        <thead>
+        <tr>
+            <th>Server</th>
+            <th>Address</th>
+            <th>Operating System</th>
+            <th>Kernel</th>
+            <th>Packages Updated</th>
+            <th>Rebooted</th>
+            <th>Status</th>
+        </tr>
+        </thead>
+
+        <tbody>
+
+        {% for host in dashboard_hosts %}
+
+        <tr>
+
+            <td>
+                <div class="server">
+                    <a href="reports/{{ host }}.html">{{ host }}</a>
+            </div>
+            <div class="ip">
+                    {{ hostvars[host].ansible_host | default(host) }}
+           </div>
+        </td>
+
+            <td>
+                {{ hostvars[host].ansible_host | default(host) }}
+            </td>
+
+            <td>
+                {{ hostvars[host].ansible_distribution | default("Unknown") }}
+                {{ hostvars[host].ansible_distribution_version | default("") }}
+            </td>
+
+            <td>
+                {{ hostvars[host].ansible_kernel | default("Unknown") }}
+            </td>
+
+            <td>
+                {% if hostvars[host].packages_changed | default(false) %}
+                    <span class="yes">Yes</span>
+                {% else %}
+                    <span class="no">No</span>
+                {% endif %}
+            </td>
+
+            <td>
+                {% if hostvars[host].reboot_performed | default(false) %}
+                    <span class="status-reboot">Yes</span>
+                {% else %}
+                    <span class="no">No</span>
+                {% endif %}
+            </td>
+
+            <td>
+                {% if hostvars[host].reboot_performed | default(false) %}
+                    <span class="status-reboot">Rebooted</span>
+                {% elif hostvars[host].packages_changed | default(false) %}
+                    <span class="status-updated">Updated</span>
+                {% else %}
+                    <span class="status-ok">Healthy</span>
+                {% endif %}
+            </td>
+
+        </tr>
+
+        {% endfor %}
+
+        </tbody>
+
+    </table>
+
+    <div class="footer">
+        Generated automatically by Ansible on Saturn.
+    </div>
+
+</div>
+
+</body>
+</html>
